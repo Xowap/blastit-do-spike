@@ -503,6 +503,10 @@ def run_all():
     def _():
         return python_heap_cow_probe()
 
+    @probe("R4_python_heap_cow_immortal", R)
+    def _():
+        return in_child(lambda: python_heap_cow_probe(immortal=True), timeout=120)
+
     R["summary"] = summarize(R)
     print("[summary] " + json.dumps(R["summary"]), file=LOG, flush=True)
     return R
@@ -1046,7 +1050,30 @@ def exec_barrier_probe():
     return out
 
 
-def python_heap_cow_probe(n_objects=250_000, n_children=5):
+def immortalize():
+    """Mark every reachable object immortal (CPython 3.12+, 64-bit LE): no refcount writes after fork."""
+    import gc
+    seen = set()
+    stack = list(gc.get_objects())
+    n = 0
+    while stack:
+        o = stack.pop()
+        i = id(o)
+        if i in seen:
+            continue
+        seen.add(i)
+        ctypes.c_uint32.from_address(i).value = 0xFFFFFFFF
+        n += 1
+        stack.extend(gc.get_referents(o))
+    return n
+
+
+FUNCS_SRC = "\n".join(
+    f"def f{i}(x):\n    y = x + {i}\n    return [y, str(y), {{'k': y}}]\n" for i in range(3000)
+)
+
+
+def python_heap_cow_probe(n_objects=250_000, n_children=5, immortal=False):
     """Cost per child of touching a fraction of a preloaded Python heap (cgroup v1 usage)."""
     import gc
     import random
@@ -1061,10 +1088,24 @@ def python_heap_cow_probe(n_objects=250_000, n_children=5):
     gc.collect()
     u0 = usage()
     objs = [{"k": i, "v": f"value-{i}"} for i in range(n_objects)]
+    ns = {}
+    exec(compile(FUNCS_SRC, "<funcs>", "exec"), ns)
+    funcs = [ns[f"f{i}"] for i in range(3000)]
+    for f in funcs:           # warm up so the specializing interpreter is done before fork
+        for _ in range(10):
+            f(1)
     gc.collect()
+    out = {"runs": {}}
+    if immortal:
+        t0 = time.monotonic()
+        out["immortalized_objects"] = immortalize()
+        out["immortalize_ms"] = round((time.monotonic() - t0) * 1000)
+        out["refcount_after"] = sys.getrefcount(objs[0])
+        gc.collect()
     gc.freeze()
     u1 = usage()
-    out = {"heap_cost_mib": round((u1 - u0) / 2**20, 1) if u0 and u1 else None, "runs": {}}
+    out["heap_cost_mib"] = round((u1 - u0) / 2**20, 1) if u0 and u1 else None
+    fidx = random.Random(7).sample(range(3000), 30)
     rng = random.Random(42)
     plans = {
         "touch_none": [],
@@ -1072,6 +1113,7 @@ def python_heap_cow_probe(n_objects=250_000, n_children=5):
         "touch_1pct_random": rng.sample(range(n_objects), n_objects // 100),
         "touch_10pct_contiguous": list(range(n_objects // 10)),
         "touch_100pct": list(range(n_objects)),
+        "call_1pct_functions": "funcs",
     }
     for name, idx in plans.items():
         time.sleep(1)
@@ -1085,8 +1127,13 @@ def python_heap_cow_probe(n_objects=250_000, n_children=5):
                 os.close(r); os.close(w2)
                 drop_to(32000 + i)
                 acc = 0
-                for j in idx:
-                    acc += objs[j]["k"]   # refcount writes on the dict and the int
+                if idx == "funcs":
+                    for j in fidx:
+                        for _ in range(100):
+                            acc += len(funcs[j](j))
+                else:
+                    for j in idx:
+                        acc += objs[j]["k"]   # refcount writes on the dict and the int
                 os.write(w, b"1")
                 os.read(r2, 1)
                 os._exit(0)
@@ -1099,11 +1146,12 @@ def python_heap_cow_probe(n_objects=250_000, n_children=5):
         for p in pids:
             os.waitpid(p, 0)
         out["runs"][name] = {
-            "objects_touched": len(idx),
+            "objects_touched": len(idx) if idx != "funcs" else "30 functions x100 calls",
             "per_child_mib": round((with_children - base) / n_children / 2**20, 2) if base and with_children else None,
         }
-    gc.unfreeze()
-    del objs
+    if not immortal:
+        gc.unfreeze()
+    del objs, funcs, ns
     gc.collect()
     return out
 
@@ -1156,6 +1204,7 @@ def summarize(R):
     s["R2_fork_ms"] = {k: v.get("fork_ms") for k, v in ms.items() if k.startswith("parent_")}
     s["R3_exec_barrier_works"] = g("R3_exec_barrier", "barrier_works")
     s["R3_python_heap_cow"] = g("R3_python_heap_cow")
+    s["R4_python_heap_cow_immortal"] = g("R4_python_heap_cow_immortal", "result")
     s["pid1"] = g("environment", "pid") == 1
     s["kernel"] = g("environment", "uname", "release")
     return s
