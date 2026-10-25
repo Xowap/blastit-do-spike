@@ -479,6 +479,22 @@ def run_all():
         out["subreaper"] = _try(lambda: prctl(PR_SET_CHILD_SUBREAPER, 1) or "ok")
         return out
 
+    @probe("R2_peer_identity", R)
+    def _():
+        return peer_identity_probe()
+
+    @probe("R2_socket_dac", R)
+    def _():
+        return socket_dac_probe()
+
+    @probe("R2_proc_leaks", R)
+    def _():
+        return proc_leak_probe()
+
+    @probe("R2_memory_scaling", R)
+    def _():
+        return memory_scaling_probe()
+
     R["summary"] = summarize(R)
     print("[summary] " + json.dumps(R["summary"]), file=LOG, flush=True)
     return R
@@ -646,6 +662,353 @@ def memory_probe(n_children=20, buf_mib=128, n_objects=200_000):
             "n_objects": n_objects, "runs": results}
 
 
+# --------------------------------------------------------------------------- #
+# Round 2
+
+
+SCM_CREDENTIALS = 2
+SO_PASSCRED = 16
+
+
+def _wait_path(path, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            raise TimeoutError(path)
+        time.sleep(0.02)
+
+
+def _parse_creds(ancdata):
+    for level, typ, data in ancdata:
+        if level == socket.SOL_SOCKET and typ == SCM_CREDENTIALS:
+            p, u, g = struct.unpack("3i", data[:12])
+            return {"pid": p, "uid": u, "gid": g}
+    return None
+
+
+def peer_identity_probe():
+    """Which peer-identity mechanisms report the *connecting* process's uid?"""
+    out = {}
+    d = "/tmp/spike-peer"
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o777)
+    path = f"{d}/s"
+    if os.path.exists(path):
+        os.unlink(path)
+
+    # Client, uid 20051: waits for the listener created by uid 20050.
+    cpid = os.fork()
+    if cpid == 0:
+        try:
+            drop_to(20051)
+            _wait_path(path)
+            time.sleep(0.1)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(path)
+            obs = {"client_uid": os.getuid(), "client_pid": os.getpid()}
+            p, u, g = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            obs["client_sees_server"] = {"pid": p, "uid": u, "gid": g}
+            s.sendall(b"plain")
+            time.sleep(0.2)
+            true = struct.pack("3i", os.getpid(), os.getuid(), os.getgid())
+            obs["send_true_creds"] = _try(lambda: s.sendmsg([b"true!"], [(socket.SOL_SOCKET, SCM_CREDENTIALS, true)]))
+            time.sleep(0.2)
+            forged = struct.pack("3i", os.getpid(), 0, 0)
+            obs["send_forged_uid0"] = _try(lambda: s.sendmsg([b"forge"], [(socket.SOL_SOCKET, SCM_CREDENTIALS, forged)]))
+            time.sleep(0.2)
+            s.sendall(json.dumps(obs).encode())
+            s.close()
+        finally:
+            os._exit(0)
+
+    def listener():
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, SO_PASSCRED, 1)
+        srv.bind(path)
+        os.chmod(path, 0o777)
+        srv.listen(4)
+        srv.settimeout(10)
+        conn, _ = srv.accept()
+        conn.setsockopt(socket.SOL_SOCKET, SO_PASSCRED, 1)
+        res = {"listener_uid": os.getuid(), "listener_pid": os.getpid()}
+        p, u, g = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        res["accepted_SO_PEERCRED"] = {"pid": p, "uid": u, "gid": g}
+        msgs = []
+        conn.settimeout(5)
+        for _ in range(6):
+            try:
+                data, anc, _, _ = conn.recvmsg(65536, socket.CMSG_SPACE(12))
+            except Exception as e:  # noqa: BLE001
+                msgs.append({"error": str(e)})
+                break
+            if not data:
+                break
+            msgs.append({"data": data[:300].decode(errors="replace"), "creds": _parse_creds(anc)})
+        res["messages"] = msgs
+        srv.close()
+        return res
+
+    out["listener_uid20050_client_uid20051"] = in_child(listener, uid=20050)
+    os.waitpid(cpid, 0)
+    if os.path.exists(path):
+        os.unlink(path)
+
+    # Same, but root listener (what dbproxy-as-root or init would see), stream + seqpacket
+    for typ_name, typ in (("stream", socket.SOCK_STREAM), ("seqpacket", socket.SOCK_SEQPACKET)):
+        p2 = f"{d}/root-{typ_name}"
+        if os.path.exists(p2):
+            os.unlink(p2)
+        srv = socket.socket(socket.AF_UNIX, typ)
+        srv.setsockopt(socket.SOL_SOCKET, SO_PASSCRED, 1)
+        srv.bind(p2)
+        os.chmod(p2, 0o777)
+        srv.listen(4)
+        srv.settimeout(10)
+        cpid = os.fork()
+        if cpid == 0:
+            try:
+                drop_to(20052)
+                s = socket.socket(socket.AF_UNIX, typ)
+                s.connect(p2)
+                s.send(b"hello")
+                time.sleep(0.3)
+            finally:
+                os._exit(0)
+        conn, _ = srv.accept()
+        conn.setsockopt(socket.SOL_SOCKET, SO_PASSCRED, 1)
+        p, u, g = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        conn.settimeout(5)
+        data, anc, _, _ = conn.recvmsg(100, socket.CMSG_SPACE(12))
+        out[f"root_listener_{typ_name}_client_uid20052"] = {
+            "SO_PEERCRED": {"pid": p, "uid": u, "gid": g},
+            "SO_PASSCRED_auto_creds": _parse_creds(anc),
+            "client_pid": cpid,
+        }
+        conn.close(); srv.close()
+        os.waitpid(cpid, 0)
+        os.unlink(p2)
+    return out
+
+
+def socket_dac_probe():
+    """Is file permission on a Unix socket enforced at connect()? Does /proc/self/cwd work as a socket dir?"""
+    out = {}
+    base = "/tmp/spike-dac"
+    os.makedirs(base, exist_ok=True)
+    os.chmod(base, 0o755)
+
+    def serve_once(srv, n):
+        got = []
+        srv.settimeout(3)
+        for _ in range(n):
+            try:
+                c, _ = srv.accept()
+                c.sendall(b"k")
+                c.close()
+                got.append("accepted")
+            except socket.timeout:
+                got.append("timeout")
+        return got
+
+    def connect_child(path, uid, cwd=None):
+        def fn():
+            if cwd:
+                os.chdir(cwd)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect(path)
+            r = s.recv(1)
+            s.close()
+            return f"connected ({r!r})"
+        return in_child(fn, uid=uid, timeout=8)
+
+    # E: socket owned by 20060, mode 0600
+    path = f"{base}/s0600"
+    if os.path.exists(path):
+        os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    os.chown(path, 20060, 20060)
+    os.chmod(path, 0o600)
+    srv.listen(8)
+    th = threading.Thread(target=lambda: out.__setitem__("accepts_0600", serve_once(srv, 2)))
+    th.start()
+    out["owner_uid20060_connect"] = connect_child(path, 20060)
+    out["other_uid20061_connect"] = connect_child(path, 20061)
+    th.join()
+    srv.close()
+    os.unlink(path)
+
+    # E2: socket in a 0700 dir owned by 20062
+    d2 = f"{base}/d20062"
+    os.makedirs(d2, exist_ok=True)
+    path = f"{d2}/s"
+    if os.path.exists(path):
+        os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    os.chmod(path, 0o666)
+    os.chown(d2, 20062, 20062)
+    os.chmod(d2, 0o700)
+    srv.listen(8)
+    th = threading.Thread(target=lambda: out.__setitem__("accepts_dir0700", serve_once(srv, 2)))
+    th.start()
+    out["dir_owner_uid20062_connect"] = connect_child(path, 20062)
+    out["other_uid20063_connect_via_dir0700"] = connect_child(path, 20063)
+    th.join()
+    srv.close()
+
+    # F: /proc/self/cwd as the socket directory (same string for every view)
+    d3 = f"{base}/v20070"
+    os.makedirs(d3, exist_ok=True)
+    path = f"{d3}/.s.PGSQL.5432"
+    if os.path.exists(path):
+        os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    os.chown(path, 20070, 20070)
+    os.chmod(path, 0o600)
+    os.chown(d3, 20070, 20070)
+    os.chmod(d3, 0o700)
+    srv.listen(8)
+    th = threading.Thread(target=lambda: out.__setitem__("accepts_proc_self_cwd", serve_once(srv, 1)))
+    th.start()
+    out["proc_self_cwd_connect_uid20070"] = connect_child("/proc/self/cwd/.s.PGSQL.5432", 20070, cwd=d3)
+    th.join()
+    srv.close()
+    # what does /proc/self/cwd resolve to for a uid that cannot read the dir of another?
+    out["proc_self_cwd_readlink"] = in_child(lambda: (os.chdir(d3), os.readlink("/proc/self/cwd"))[1], uid=20070)
+    return out
+
+
+def proc_leak_probe():
+    """What can a uid read about another uid's process under gVisor, with and without PR_SET_DUMPABLE(0)?"""
+    out = {}
+    for label, dumpable in (("normal", True), ("dumpable0", False)):
+        r, w = os.pipe()
+        victim = os.fork()
+        if victim == 0:
+            drop_to(20081)
+            os.set_inheritable(w, True)
+            code = ("import ctypes,os,time;"
+                    + ("" if dumpable else "ctypes.CDLL(None).prctl(4,0,0,0,0);")
+                    + "f=open('/etc/hostname');"
+                    "os.write(%d,b'1');time.sleep(60)" % w)
+            os.execve(sys.executable, [sys.executable, "-c", code], {"SECRET": "hunter2"})
+        os.close(w)
+        os.read(r, 1)
+        os.close(r)
+        time.sleep(0.2)
+
+        def attacker(v=victim):
+            res = {}
+            for f in ("environ", "cmdline", "maps", "status", "stat", "io", "mem", "auxv", "stack", "syscall"):
+                res[f] = _try(lambda f=f: open(f"/proc/{v}/{f}", "rb").read()[:120])
+            res["fd_list"] = _try(lambda: os.listdir(f"/proc/{v}/fd"))
+            res["fd3_readlink"] = _try(lambda: os.readlink(f"/proc/{v}/fd/3"))
+            res["cwd_readlink"] = _try(lambda: os.readlink(f"/proc/{v}/cwd"))
+            res["root_list"] = _try(lambda: os.listdir(f"/proc/{v}/root")[:5])
+            res["status_uid_line"] = _try(lambda: [l for l in open(f"/proc/{v}/status").read().splitlines() if l.startswith("Uid")])
+            res["proc_owner"] = _try(lambda: (os.stat(f"/proc/{v}").st_uid, os.stat(f"/proc/{v}/environ").st_uid,
+                                              oct(os.stat(f"/proc/{v}/environ").st_mode)))
+            return res
+        out[label] = in_child(attacker, uid=20080)
+        os.kill(victim, signal.SIGKILL)
+        os.waitpid(victim, 0)
+
+    # A forked (not exec'd) child inherits the parent's initial environ block:
+    # what does /proc/<child>/environ show after the parent changed os.environ?
+    os.environ["SPIKE_SET_AFTER_START"] = "yes"
+    r, w = os.pipe()
+    child = os.fork()
+    if child == 0:
+        drop_to(20082)
+        os.close(r)
+        os.write(w, b"1")
+        time.sleep(30)
+        os._exit(0)
+    os.close(w)
+    os.read(r, 1)
+    os.close(r)
+    env = _try(lambda: open(f"/proc/{child}/environ", "rb").read())
+    out["forked_child_environ_shows_runtime_changes"] = isinstance(env, bytes) and b"SPIKE_SET_AFTER_START" in env
+    out["forked_child_environ_head"] = env[:200] if isinstance(env, bytes) else env
+    os.kill(child, signal.SIGKILL)
+    os.waitpid(child, 0)
+    del os.environ["SPIKE_SET_AFTER_START"]
+    return out
+
+
+def memavail_kb():
+    for l in read("/proc/meminfo").splitlines():
+        if l.startswith("MemAvailable"):
+            return int(l.split()[1])
+    return None
+
+
+def cg1(name):
+    return read(f"/sys/fs/cgroup/memory/{name}").strip()
+
+
+def memory_scaling_probe(n_children=10):
+    """Per-child cost as a function of the parent's resident size."""
+    out = {"cgroup_v1": {k: cg1(k) for k in ("memory.limit_in_bytes", "memory.usage_in_bytes",
+                                                "memory.max_usage_in_bytes")},
+           "cgroup_v1_stat_head": cg1("memory.stat")[:600]}
+    import gc
+    for mib in (0, 64, 256):
+        gc.collect()
+        time.sleep(1)
+        base = memavail_kb()
+        buf = bytearray(mib << 20) if mib else bytearray(1)
+        mv = memoryview(buf)
+        for off in range(0, len(buf), 4096):
+            mv[off] = 1
+        after_alloc = memavail_kb()
+        pids, releases, fork_ms, avail_steps = [], [], [], []
+        for i in range(n_children):
+            r, w = os.pipe()
+            r2, w2 = os.pipe()
+            t0 = time.monotonic()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r); os.close(w2)
+                drop_to(31000 + i)
+                buf.count(1)
+                os.write(w, b"1")
+                os.read(r2, 1)
+                os._exit(0)
+            fork_ms.append(round((time.monotonic() - t0) * 1000, 1))
+            os.close(w); os.close(r2)
+            os.read(r, 1)
+            os.close(r)
+            pids.append(pid); releases.append(w2)
+            avail_steps.append(memavail_kb())
+        usage_with_children = cg1("memory.usage_in_bytes")
+        for w in releases:
+            os.write(w, b"1"); os.close(w)
+        for p in pids:
+            os.waitpid(p, 0)
+        time.sleep(2)
+        after_release = memavail_kb()
+        del mv, buf
+        gc.collect()
+        time.sleep(2)
+        after_free = memavail_kb()
+        per_child = [(avail_steps[i - 1] if i else after_alloc) - avail_steps[i] for i in range(n_children)]
+        out[f"parent_plus_{mib}MiB"] = {
+            "memavail_kb": {"base": base, "after_alloc": after_alloc, "with_children": avail_steps[-1],
+                            "after_release_2s": after_release, "after_free_2s": after_free},
+            "alloc_cost_kb": base - after_alloc,
+            "per_child_kb": per_child,
+            "per_child_avg_kb": round(sum(per_child) / n_children),
+            "fork_ms": fork_ms,
+            "cgroup_usage_with_children": usage_with_children,
+            "parent_VmRSS": status_fields().get("VmRSS"),
+        }
+    return out
+
+
 def summarize(R):
     def g(*path):
         cur = R
@@ -675,6 +1038,23 @@ def summarize(R):
     s["S6"] = {m: {"fork_ms_avg": v.get("fork_ms_avg"), "uids_ok": v.get("uids_ok"),
                    "cgroup_current": g("S6_memory", "runs", m, "snapshot_with_children_alive", "cgroup_current")}
                for m, v in runs.items()}
+    pi = g("R2_peer_identity") or {}
+    s["R2_peer_identity"] = {
+        k: {kk: (vv.get("uid") if isinstance(vv, dict) else vv) for kk, vv in v.items()
+            if kk in ("SO_PEERCRED", "SO_PASSCRED_auto_creds")}
+        for k, v in pi.items() if k.startswith("root_listener")
+    }
+    sd = g("R2_socket_dac") or {}
+    s["R2_socket_dac"] = {k: (v.get("result") or v.get("error")) for k, v in sd.items()
+                          if isinstance(v, dict) and k.endswith("connect") or k.endswith("connect_uid20070")
+                          or k.endswith("via_dir0700")}
+    pl = g("R2_proc_leaks") or {}
+    s["R2_environ_readable_cross_uid"] = {
+        k: str(g("R2_proc_leaks", k, "result", "environ"))[:60] for k in ("normal", "dumpable0")}
+    s["R2_forked_child_environ_shows_runtime_changes"] = pl.get("forked_child_environ_shows_runtime_changes")
+    ms = g("R2_memory_scaling") or {}
+    s["R2_memory_per_child_kb"] = {k: v.get("per_child_avg_kb") for k, v in ms.items() if k.startswith("parent_")}
+    s["R2_fork_ms"] = {k: v.get("fork_ms") for k, v in ms.items() if k.startswith("parent_")}
     s["pid1"] = g("environment", "pid") == 1
     s["kernel"] = g("environment", "uname", "release")
     return s
