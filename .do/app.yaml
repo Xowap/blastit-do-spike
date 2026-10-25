@@ -2,10 +2,9 @@ name: blastit-do-spike
 region: fra
 services:
   - name: probe
-    github:
-      repo: Xowap/blastit-do-spike
+    git:
+      repo_clone_url: https://github.com/Xowap/blastit-do-spike.git
       branch: main
-      deploy_on_push: true
     dockerfile_path: Dockerfile
     http_port: 8080
     instance_count: 1
