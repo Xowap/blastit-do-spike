@@ -12,6 +12,8 @@ time.
 import ctypes
 import ctypes.util
 import errno
+import hashlib
+import re
 import json
 import os
 import platform
@@ -166,6 +168,10 @@ def probe(name, results):
 
 def run_all():
     R = {}
+
+    @probe("R5_secret_barrier", R)
+    def _():
+        return secret_barrier_probe()
 
     @probe("environment", R)
     def _():
@@ -1156,6 +1162,186 @@ def python_heap_cow_probe(n_objects=250_000, n_children=5, immortal=False):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Round 5: secret injected by the platform, hidden from children
+
+
+SECRET_ENV = "SPIKE_SECRET"
+STAGE0 = {}
+
+
+def stage0():
+    """PID 1 with the platform's real environment: hand the secret off, then re-exec clean."""
+    secret = os.environ.get(SECRET_ENV)
+    info = {"roles": {}, "sha256": None}
+    if secret:
+        info["sha256"] = hashlib.sha256(secret.encode()).hexdigest()
+        # Negative control: forked WITHOUT exec, so it keeps the initial environ block.
+        pid = os.fork()
+        if pid == 0:
+            drop_to(20500)
+            while True:
+                time.sleep(3600)
+        info["roles"][str(pid)] = "control: forked from stage 0, no exec (expected to leak)"
+        # Holder (dbproxy stand-in): fork + exec with an EMPTY env, secret over a pipe.
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(w)
+            drop_to(20503)
+            os.set_inheritable(r, True)
+            holder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holder.py")
+            os.execve(sys.executable, [sys.executable, holder, str(r)], {})
+        os.close(r)
+        os.write(w, secret.encode())
+        os.close(w)
+        info["roles"][str(pid)] = "holder: fork + execve(env={}), secret via pipe"
+        secret = None
+    env = {k: v for k, v in os.environ.items() if k != SECRET_ENV}
+    os.execve(sys.executable, [sys.executable, os.path.abspath(__file__), "--stage1", json.dumps(info)], env)
+
+
+def _needle():
+    # Built at runtime so this source never contains a full match.
+    return re.compile(b"BLASTIT" + b"SECRET-" + b"[0-9a-f]{32}")
+
+
+def _scan_mem(pid, pat):
+    """Scan a process's readable mappings via /proc/<pid>/mem. Returns (hits, bytes, error)."""
+    hits, scanned = set(), 0
+    try:
+        maps = open(f"/proc/{pid}/maps").read().splitlines()
+        mem = open(f"/proc/{pid}/mem", "rb", buffering=0)
+    except OSError as e:
+        return [], 0, f"{errno.errorcode.get(e.errno, e.errno)}"
+    with mem:
+        for line in maps:
+            parts = line.split()
+            lo, hi = (int(x, 16) for x in parts[0].split("-"))
+            if "r" not in parts[1] or hi - lo > 1 << 30:
+                continue
+            if len(parts) > 5 and parts[5] in ("[vvar]", "[vsyscall]", "[usertrap]"):
+                continue
+            addr = lo
+            while addr < hi:
+                n = min(4 << 20, hi - addr)
+                try:
+                    mem.seek(addr)
+                    data = mem.read(n)
+                except OSError:
+                    break
+                if not data:
+                    break
+                scanned += len(data)
+                hits.update(hashlib.sha256(m).hexdigest() for m in pat.findall(data))
+                addr += n
+    return sorted(hits), scanned, None
+
+
+def scan_everything():
+    pat = _needle()
+    labels = {"1": "init (stage 1, after execve)", str(os.getpid()): "scanner itself"}
+    labels.update(STAGE0.get("roles", {}))
+    out = {"scanner_uid": os.getuid(), "findings": [], "denied": {}, "scanned": {}}
+
+    def found(where, pid, hits):
+        for h in hits:
+            out["findings"].append({"where": where, "pid": pid, "role": labels.get(str(pid), "other"),
+                                    "is_the_secret": h == STAGE0.get("sha256")})
+
+    # 1. Own memory FIRST (inherited from stage-1 PID 1), before reading anything else.
+    #    A planted fake value proves the memory scan can see a match at all.
+    canary = b"BLASTIT" + b"SECRET-" + b"0" * 32  # noqa: F841 (kept alive on purpose)
+    canary_sha = hashlib.sha256(canary).hexdigest()
+    _try(lambda: prctl(PR_SET_DUMPABLE, 1))  # setuid cleared it; /proc/self/mem needs it
+    hits, n, err = _scan_mem("self", pat)
+    out["scanned"]["own_memory_bytes"] = n
+    if err:
+        out["denied"]["own_memory"] = err
+    out["own_memory_canary_found (scanner sensitivity)"] = canary_sha in hits
+    found("own memory (/proc/self/mem)", os.getpid(), [h for h in hits if h != canary_sha])
+
+    # 2. environ + cmdline of every process.
+    pids = sorted(int(p) for p in os.listdir("/proc") if p.isdigit())
+    out["scanned"]["pids"] = len(pids)
+    for pid in pids:
+        for f in ("environ", "cmdline"):
+            try:
+                data = open(f"/proc/{pid}/{f}", "rb").read()
+            except OSError as e:
+                out["denied"].setdefault(f, []).append(pid)
+                continue
+            found(f"/proc/<pid>/{f}", pid, {hashlib.sha256(m).hexdigest() for m in pat.findall(data)})
+
+    # 3. Other processes' memory.
+    for pid in pids:
+        if pid == os.getpid():
+            continue
+        hits, n, err = _scan_mem(pid, pat)
+        if err:
+            out["denied"].setdefault("mem", []).append(pid)
+        found("/proc/<pid>/mem", pid, hits)
+
+    # 4. Writable / config filesystem locations.
+    nfiles = 0
+    for root in ("/etc", "/run", "/var/run", "/tmp", "/root", "/app", "/home", "/dev/shm", "/var/tmp"):
+        for dp, dns, fns in os.walk(root):
+            for fn in fns:
+                fp = os.path.join(dp, fn)
+                try:
+                    if os.path.getsize(fp) > 4 << 20:
+                        continue
+                    data = open(fp, "rb").read()
+                except OSError:
+                    continue
+                nfiles += 1
+                hits = {hashlib.sha256(m).hexdigest() for m in pat.findall(data)}
+                for h in hits:
+                    out["findings"].append({"where": f"file {fp}", "is_the_secret": h == STAGE0.get("sha256")})
+    out["scanned"]["files"] = nfiles
+    for k, v in list(out["denied"].items()):
+        if isinstance(v, list):
+            out["denied"][k] = {"count": len(v), "pids": v[:20]}
+    return out
+
+
+def secret_barrier_probe():
+    out = {"stage0_had_secret": bool(STAGE0.get("sha256")), "roles": STAGE0.get("roles")}
+    if not STAGE0.get("sha256"):
+        out["verdict"] = f"no {SECRET_ENV} in the platform environment; nothing to test"
+        return out
+    out["stage0_secret_sha256"] = STAGE0["sha256"]
+    out["pid1_os_environ_has_var"] = SECRET_ENV in os.environ
+    out["pid1_proc_environ_has_var"] = SECRET_ENV.encode() in open("/proc/1/environ", "rb").read()
+    for _ in range(50):
+        if os.path.exists("/tmp/holder-proof.json"):
+            break
+        time.sleep(0.1)
+    proof = json.loads(read("/tmp/holder-proof.json") or "{}")
+    out["holder"] = {"env_keys": proof.get("env_keys"), "uid": proof.get("uid"),
+                     "proves_possession": proof.get("sha256") == STAGE0["sha256"]}
+    out["scan_as_view_uid"] = in_child(scan_everything, uid=20510, timeout=120)
+    out["scan_as_root_forked_from_stage1"] = in_child(scan_everything, timeout=120)
+
+    view = (out["scan_as_view_uid"].get("result") or {}).get("findings", [])
+    roles = STAGE0.get("roles", {})
+    control = [p for p, r in roles.items() if r.startswith("control")]
+    leaks = [f for f in view if f.get("is_the_secret") and str(f.get("pid")) not in control]
+    control_hits = [f for f in view if f.get("is_the_secret") and str(f.get("pid")) in control]
+    vres = out["scan_as_view_uid"].get("result") or {}
+    out["verdict"] = {
+        "holder_has_secret": out["holder"]["proves_possession"],
+        "view_uid_own_memory_scanned_bytes": vres.get("scanned", {}).get("own_memory_bytes"),
+        "view_uid_canary_found (memory scan works)": vres.get("own_memory_canary_found (scanner sensitivity)"),
+        "view_uid_finds_secret_in_control (environ scan works)": len(control_hits),
+        "view_uid_finds_secret_outside_control": len(leaks),
+        "leaks": leaks,
+        "hidden": bool(out["holder"]["proves_possession"] and not leaks
+                       and vres.get("own_memory_canary_found (scanner sensitivity)")),
+    }
+    return out
+
+
 def summarize(R):
     def g(*path):
         cur = R
@@ -1205,6 +1391,8 @@ def summarize(R):
     s["R3_exec_barrier_works"] = g("R3_exec_barrier", "barrier_works")
     s["R3_python_heap_cow"] = g("R3_python_heap_cow")
     s["R4_python_heap_cow_immortal"] = g("R4_python_heap_cow_immortal", "result")
+    sb = g("R5_secret_barrier") or {}
+    s["R5_secret_barrier"] = sb.get("verdict")
     s["pid1"] = g("environment", "pid") == 1
     s["kernel"] = g("environment", "uname", "release")
     return s
@@ -1242,6 +1430,10 @@ def reap(_sig, _frame):
 
 
 if __name__ == "__main__":
+    if "--stage1" in sys.argv:
+        STAGE0 = json.loads(sys.argv[sys.argv.index("--stage1") + 1])
+    elif os.getpid() == 1 and "--once" not in sys.argv:
+        stage0()
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
         LOG = sys.stderr
         print(json.dumps(run_all(), indent=2, default=str))
