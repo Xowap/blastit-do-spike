@@ -495,6 +495,14 @@ def run_all():
     def _():
         return memory_scaling_probe()
 
+    @probe("R3_exec_barrier", R)
+    def _():
+        return exec_barrier_probe()
+
+    @probe("R3_python_heap_cow", R)
+    def _():
+        return python_heap_cow_probe()
+
     R["summary"] = summarize(R)
     print("[summary] " + json.dumps(R["summary"]), file=LOG, flush=True)
     return R
@@ -1009,6 +1017,97 @@ def memory_scaling_probe(n_children=10):
     return out
 
 
+def exec_barrier_probe():
+    """Does re-exec'ing with a clean env clear what other uids see in /proc/<pid>/environ?"""
+    out = {}
+    r, w = os.pipe()
+    victim = os.fork()
+    if victim == 0:
+        os.close(r)
+        drop_to(20091)
+        os.set_inheritable(w, True)
+        # stage 0 has SECRET; it signals, waits 1s, then execs itself with a clean env
+        stage1 = "import os,time;os.write(%d,b'2');time.sleep(60)" % w
+        stage0 = ("import os,sys,time;os.write(%d,b'1');time.sleep(1.0);"
+                  "os.execve(sys.executable,[sys.executable,'-c',%r],{'STAGE':'1'})" % (w, stage1))
+        os.execve(sys.executable, [sys.executable, "-c", stage0], {"SECRET": "hunter2", "STAGE": "0"})
+    os.close(w)
+    os.read(r, 1)
+    out["before_exec"] = in_child(lambda: open(f"/proc/{victim}/environ", "rb").read(), uid=20090)
+    os.read(r, 1)
+    time.sleep(0.2)
+    out["after_exec"] = in_child(lambda: open(f"/proc/{victim}/environ", "rb").read(), uid=20090)
+    out["pid_unchanged"] = True
+    os.kill(victim, signal.SIGKILL)
+    os.waitpid(victim, 0)
+    os.close(r)
+    out["barrier_works"] = ("hunter2" in str(out["before_exec"].get("result"))
+                            and "hunter2" not in str(out["after_exec"].get("result")))
+    return out
+
+
+def python_heap_cow_probe(n_objects=250_000, n_children=5):
+    """Cost per child of touching a fraction of a preloaded Python heap (cgroup v1 usage)."""
+    import gc
+    import random
+
+    def usage():
+        v = cg1("memory.usage_in_bytes")
+        if v.isdigit():
+            return int(v)
+        v = read("/sys/fs/cgroup/memory.current").strip()
+        return int(v) if v.isdigit() else None
+
+    gc.collect()
+    u0 = usage()
+    objs = [{"k": i, "v": f"value-{i}"} for i in range(n_objects)]
+    gc.collect()
+    gc.freeze()
+    u1 = usage()
+    out = {"heap_cost_mib": round((u1 - u0) / 2**20, 1) if u0 and u1 else None, "runs": {}}
+    rng = random.Random(42)
+    plans = {
+        "touch_none": [],
+        "touch_0.1pct_random": rng.sample(range(n_objects), n_objects // 1000),
+        "touch_1pct_random": rng.sample(range(n_objects), n_objects // 100),
+        "touch_10pct_contiguous": list(range(n_objects // 10)),
+        "touch_100pct": list(range(n_objects)),
+    }
+    for name, idx in plans.items():
+        time.sleep(1)
+        base = usage()
+        pids, releases = [], []
+        for i in range(n_children):
+            r, w = os.pipe()
+            r2, w2 = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r); os.close(w2)
+                drop_to(32000 + i)
+                acc = 0
+                for j in idx:
+                    acc += objs[j]["k"]   # refcount writes on the dict and the int
+                os.write(w, b"1")
+                os.read(r2, 1)
+                os._exit(0)
+            os.close(w); os.close(r2)
+            os.read(r, 1); os.close(r)
+            pids.append(pid); releases.append(w2)
+        with_children = usage()
+        for w in releases:
+            os.write(w, b"1"); os.close(w)
+        for p in pids:
+            os.waitpid(p, 0)
+        out["runs"][name] = {
+            "objects_touched": len(idx),
+            "per_child_mib": round((with_children - base) / n_children / 2**20, 2) if base and with_children else None,
+        }
+    gc.unfreeze()
+    del objs
+    gc.collect()
+    return out
+
+
 def summarize(R):
     def g(*path):
         cur = R
@@ -1055,6 +1154,8 @@ def summarize(R):
     ms = g("R2_memory_scaling") or {}
     s["R2_memory_per_child_kb"] = {k: v.get("per_child_avg_kb") for k, v in ms.items() if k.startswith("parent_")}
     s["R2_fork_ms"] = {k: v.get("fork_ms") for k, v in ms.items() if k.startswith("parent_")}
+    s["R3_exec_barrier_works"] = g("R3_exec_barrier", "barrier_works")
+    s["R3_python_heap_cow"] = g("R3_python_heap_cow")
     s["pid1"] = g("environment", "pid") == 1
     s["kernel"] = g("environment", "uname", "release")
     return s
